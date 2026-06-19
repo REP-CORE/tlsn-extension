@@ -30,7 +30,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use verifier::verifier;
+use verifier::{notary, verifier};
 use ws::{TungsteniteStream, WsUpgrade};
 use ws_stream_tungstenite::WsStream;
 
@@ -67,6 +67,7 @@ async fn main() {
         .route("/session", get(session_ws_handler))
         .route("/verifier", get(verifier_ws_handler))
         .route("/proxy", get(proxy_ws_handler))
+        .route("/notary", get(notary_ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
@@ -96,6 +97,10 @@ async fn main() {
         addr
     );
     info!("Proxy WebSocket endpoint: ws://{}/proxy?token=<host>", addr);
+    info!(
+        "Notary WebSocket endpoint: ws://{}/notary (signed presentations, MPC-only)",
+        addr
+    );
 
     axum::serve(listener, app)
         .await
@@ -229,6 +234,17 @@ struct ProxyQuery {
     token: String,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+}
+
+// Query parameters for the notary WebSocket connection. The prover passes the
+// limits it requested in its MPC commit so the notary's ceilings always match;
+// defaults are MPC-safe (256 KiB recv = the device-side cap, see the OOM fix).
+#[derive(Debug, Deserialize)]
+struct NotaryQuery {
+    #[serde(rename = "maxSentData")]
+    max_sent_data: Option<usize>,
+    #[serde(rename = "maxRecvData")]
+    max_recv_data: Option<usize>,
 }
 
 // ============================================================================
@@ -730,6 +746,36 @@ pub(crate) async fn verifier_ws_handler(
     }
 }
 
+// Notary handler — single-socket, self-contained. Unlike /verifier (which is
+// paired with a relying party that opened /session and later sends reveal_config),
+// the notary just runs the MPC commitment and signs an Attestation back to the
+// prover. No session storage, no reveal_config, no webhook: the notary stays
+// blind to the plaintext and the prover keeps the portable Presentation.
+pub(crate) async fn notary_ws_handler(
+    ws: WsUpgrade,
+    Query(query): Query<NotaryQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let max_sent = query.max_sent_data.unwrap_or(16 * 1024);
+    let max_recv = query.max_recv_data.unwrap_or(256 * 1024);
+    info!(
+        "[Notary] New notary connection (max_sent={}, max_recv={})",
+        max_sent, max_recv
+    );
+    Ok(ws.on_upgrade(move |socket| async move {
+        // TungsteniteStream -> futures WsStream -> tokio (.compat()); notary()
+        // takes tokio AsyncRead/Write and re-wraps for the tlsn Session.
+        let stream = WsStream::new(socket).compat();
+        // Match the verifier task's generous timeout — MPC ZK execution on large
+        // transcripts can run minutes; sessions are self-cleaning either way.
+        let notary_timeout = Duration::from_secs(1800);
+        match timeout(notary_timeout, notary(stream, max_sent, max_recv)).await {
+            Ok(Ok(())) => info!("[Notary] ✅ Attestation signed and sent"),
+            Ok(Err(e)) => error!("[Notary] ❌ Failed: {}", e),
+            Err(_) => error!("[Notary] ⏱️  Timed out after {:?}", notary_timeout),
+        }
+    }))
+}
+
 // WebSocket proxy handler - bridges WebSocket to TCP
 // Compatible with notary.pse.dev: /proxy?token=<host> or legacy /proxy?host=<host>
 // In proxy mode: /proxy?token=<host>&sessionId=<id> routes to verifier task
@@ -1000,8 +1046,15 @@ async fn run_verifier_task(
     // Convert from futures AsyncRead/AsyncWrite to tokio AsyncRead/AsyncWrite
     let stream = stream.compat();
 
-    // Run the verifier with timeout
-    let verification_timeout = Duration::from_secs(120);
+    // Run the verifier with timeout.
+    //
+    // 120s was too tight for large transcripts (50KB+ responses) — MPC
+    // ZK-execution on the prover side easily exceeded 2 minutes, the
+    // verifier dropped the WebSocket, and the prover's vm.execute_all()
+    // read EOF on the inner MPC receiver channel ("execution error: inner
+    // receiver error: io error: unexpected end of file"). Bumped to 30 min.
+    // Cost is bounded — sessions clean up on completion either way.
+    let verification_timeout = Duration::from_secs(1800);
     info!(
         "[{}] Starting verification with timeout of {:?}",
         session_id, verification_timeout

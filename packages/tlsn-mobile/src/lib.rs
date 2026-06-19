@@ -4,6 +4,7 @@
 //! All protocol logic (MPC-TLS, HTTP parsing, selective disclosure) is handled by
 //! sdk-core — this crate only provides the transport adapter (WebSocket) and FFI types.
 
+mod notarize;
 mod prover;
 mod ws_io;
 
@@ -544,4 +545,16 @@ pub fn prove(
 ) -> Result<ProofResult, TlsnError> {
     let progress_arc = progress.map(std::sync::Arc::<dyn ProgressCallback>::from);
     shared_runtime().block_on(prover::prove_async(request, options, progress_arc))
+}
+
+/// Notary mode: run an MPC-TLS session against the `/notary` endpoint and return
+/// a bincode-serialized, notary-signed `Presentation` — a portable proof that
+/// anyone can verify OFFLINE against the notary's public key + WebPKI, with no
+/// relying party in the loop. Unlike [`prove`] (interactive: the verifier IS the
+/// relying party and nothing portable survives), the returned bytes are the
+/// artifact REP stores and the user owns forever. MPC-only (the notary stays
+/// blind to plaintext). Progress is emitted via `tracing` → [`drain_logs`].
+#[uniffi::export]
+pub fn notarize(request: HttpRequest, options: ProverOptions) -> Result<Vec<u8>, TlsnError> {
+    shared_runtime().block_on(notarize::notarize_async(request, options))
 }
