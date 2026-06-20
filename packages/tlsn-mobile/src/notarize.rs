@@ -486,7 +486,15 @@ mod fly_repro_tests {
         };
         let res = notarize_async(request, options).await;
         match &res {
-            Ok(bytes) => println!("[mobile-fly] ✅ notarize SUCCEEDED: {} presentation bytes", bytes.len()),
+            Ok(bytes) => {
+                println!("[mobile-fly] ✅ notarize SUCCEEDED: {} presentation bytes", bytes.len());
+                // Save the portable presentation so `rep-verify` can verify it
+                // OFFLINE — the tangible "prove it yourself, no REP, no notary" demo.
+                let out = std::env::var("PRESENTATION_OUT")
+                    .unwrap_or_else(|_| "/tmp/rep-demo-presentation.bin".to_string());
+                std::fs::write(&out, bytes).expect("write presentation");
+                println!("[mobile-fly] saved presentation → {out}");
+            }
             Err(e) => println!("[mobile-fly] ❌ notarize FAILED: {}", e),
         }
         assert!(res.is_ok(), "mobile notarize_async failed: {:?}", res.err());

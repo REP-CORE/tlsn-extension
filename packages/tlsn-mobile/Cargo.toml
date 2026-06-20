@@ -5,7 +5,7 @@ edition = "2021"
 description = "TLSNotary mobile bindings for iOS and Android"
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "lib"]
 name = "tlsn_mobile"
 
 [[bin]]
@@ -62,3 +62,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [features]
 default = []
+
+[[bin]]
+name = "rep-verify"
+path = "src/bin/rep_verify.rs"

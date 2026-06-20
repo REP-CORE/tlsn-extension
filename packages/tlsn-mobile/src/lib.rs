@@ -5,6 +5,7 @@
 //! sdk-core — this crate only provides the transport adapter (WebSocket) and FFI types.
 
 mod notarize;
+pub use notarize::verify_presentation;
 mod prover;
 mod ws_io;
 
