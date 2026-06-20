@@ -154,6 +154,10 @@ pub async fn notarize_async(
     // headers (session cookies / auth). recv is committed whole and revealed whole.
     let sent_len = prover.transcript().sent().len();
     let recv_len = prover.transcript().received().len();
+    info!(
+        "notarize: transcript sizes sent={} recv={} (recv is the gzipped wire response)",
+        sent_len, recv_len
+    );
     let reqline_end = prover
         .transcript()
         .sent()
@@ -178,11 +182,13 @@ pub async fn notarize_async(
     }
     let disclosure_config = prove_builder.build().map_err(cfg_err)?;
 
+    info!("notarize: prove() starting (commit+prove over recv={recv_len}B)");
     let ProverOutput {
         transcript_commitments,
         transcript_secrets,
         ..
     } = prover.prove(&disclosure_config).await.map_err(conn_err)?;
+    info!("notarize: prove() done");
     let prover_transcript = prover.transcript().clone();
     let tls_transcript = prover.tls_transcript().clone();
     prover.close().await.map_err(conn_err)?;
