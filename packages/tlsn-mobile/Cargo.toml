@@ -13,6 +13,7 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
+flate2 = "1"
 # Core SDK — shared protocol engine with WASM/browser
 # For local development, override with a path in Cargo.toml:
 #   [patch."https://github.com/tlsnotary/tlsn.git"]

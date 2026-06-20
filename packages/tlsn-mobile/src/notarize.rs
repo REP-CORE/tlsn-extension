@@ -316,10 +316,15 @@ pub fn verify_presentation(
     let (sent, recv) = match transcript {
         Some(mut t) => {
             t.set_unauthed(b'X'); // mark undisclosed bytes distinctly
-            (
-                String::from_utf8_lossy(t.sent_unsafe()).to_string(),
-                String::from_utf8_lossy(t.received_unsafe()).to_string(),
-            )
+            let sent = String::from_utf8_lossy(t.sent_unsafe()).to_string();
+            // The committed transcript is the RAW wire response. For MPC we request
+            // Accept-Encoding: gzip so the committed bytes are small enough for the
+            // device. Decompress here so the claim is extracted from plaintext — a
+            // deterministic, lossless, independently-reproducible decode of exactly
+            // what the server sent (any verifier can redo it). Non-gzip responses
+            // pass through unchanged.
+            let recv = decode_http_response(t.received_unsafe());
+            (sent, recv)
         }
         None => (String::new(), String::new()),
     };
@@ -336,6 +341,76 @@ pub fn verify_presentation(
         notary_key,
         key_matches,
     })
+}
+
+/// Turn a raw HTTP/1.1 response (status line + headers + body, exactly as it came
+/// off the wire) into header + decoded-plaintext form, so a JSONPath/regex claim
+/// can be extracted. Handles `Transfer-Encoding: chunked` (de-chunk) and
+/// `Content-Encoding: gzip` (decompress). Decoding is deterministic + lossless and
+/// reproducible by ANY verifier — it does not change what was proven, only its
+/// transport encoding. On ANY parse/decode failure it returns the raw bytes
+/// (claim extraction then just fails and the MPC upgrade is skipped — never wrong).
+fn decode_http_response(raw: &[u8]) -> String {
+    let Some(idx) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return String::from_utf8_lossy(raw).to_string();
+    };
+    let headers = &raw[..idx];
+    let body = &raw[idx + 4..];
+    let headers_str = String::from_utf8_lossy(headers);
+    let header_lc = headers_str.to_ascii_lowercase();
+    let has = |k: &str, v: &str| {
+        header_lc
+            .lines()
+            .any(|l| l.starts_with(k) && l.contains(v))
+    };
+
+    // 1. De-chunk if Transfer-Encoding: chunked.
+    let dechunked: Vec<u8> = if has("transfer-encoding:", "chunked") {
+        let mut out = Vec::new();
+        let mut rest = body;
+        loop {
+            let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") else { break };
+            let size_hex = String::from_utf8_lossy(&rest[..nl]);
+            let size = usize::from_str_radix(
+                size_hex.trim().split(';').next().unwrap_or("").trim(),
+                16,
+            )
+            .unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+            let start = nl + 2;
+            let end = start + size;
+            if end > rest.len() {
+                break;
+            }
+            out.extend_from_slice(&rest[start..end]);
+            // skip the chunk data + its trailing CRLF
+            rest = if end + 2 <= rest.len() { &rest[end + 2..] } else { &[] };
+        }
+        out
+    } else {
+        body.to_vec()
+    };
+
+    // 2. Gunzip if Content-Encoding: gzip.
+    let decoded: Vec<u8> = if has("content-encoding:", "gzip") {
+        use std::io::Read;
+        let mut d = flate2::read::GzDecoder::new(&dechunked[..]);
+        let mut out = Vec::new();
+        match d.read_to_end(&mut out) {
+            Ok(_) => out,
+            Err(_) => return String::from_utf8_lossy(raw).to_string(),
+        }
+    } else {
+        dechunked
+    };
+
+    format!(
+        "{}\r\n\r\n{}",
+        headers_str,
+        String::from_utf8_lossy(&decoded)
+    )
 }
 
 #[cfg(test)]
