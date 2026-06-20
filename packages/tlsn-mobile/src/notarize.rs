@@ -323,3 +323,41 @@ pub fn verify_presentation(
         key_matches,
     })
 }
+
+#[cfg(test)]
+mod fly_repro_tests {
+    use super::*;
+    use crate::{HttpHeader, HttpRequest, ProverOptions};
+
+    /// Device-free repro of the MOBILE transport path (WsIoAdapter). Drives the
+    /// real `notarize_async` against the deployed Fly notary through a local TLS
+    /// bridge. The verifier's own test (ws_stream_tungstenite adapter) passes;
+    /// if THIS fails with "context mux error" / "bytes remaining on stream", the
+    /// custom WsIoAdapter is the bug. Run:
+    ///   socat TCP-LISTEN:9444,fork,reuseaddr OPENSSL:rep-notary.fly.dev:443,verify=0,snihost=rep-notary.fly.dev &
+    ///   FLY_BRIDGE=ws://127.0.0.1:9444 cargo test -p tlsn-mobile mobile_notarize_against_fly -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn mobile_notarize_against_fly() {
+        let base = std::env::var("FLY_BRIDGE").unwrap_or_else(|_| "ws://127.0.0.1:9444".to_string());
+        let request = HttpRequest {
+            url: "https://raw.githubusercontent.com/tlsnotary/tlsn/ceadf458f6f75909eda013aa50108f9f94956188/crates/server-fixture/server/src/data/1kb.json".to_string(),
+            method: "GET".to_string(),
+            headers: vec![HttpHeader { name: "accept".into(), value: "application/json".into() }],
+            body: None,
+        };
+        let options = ProverOptions {
+            verifier_url: base,
+            max_sent_data: 4096,
+            max_recv_data: 16384,
+            handlers: vec![],
+            mode: None,
+        };
+        let res = notarize_async(request, options).await;
+        match &res {
+            Ok(bytes) => println!("[mobile-fly] ✅ notarize SUCCEEDED: {} presentation bytes", bytes.len()),
+            Err(e) => println!("[mobile-fly] ❌ notarize FAILED: {}", e),
+        }
+        assert!(res.is_ok(), "mobile notarize_async failed: {:?}", res.err());
+    }
+}

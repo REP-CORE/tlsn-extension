@@ -131,9 +131,16 @@ pub(crate) async fn prove_until_reveal_async(
         Ok(Ok(p)) => p,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
-            return Err(TlsnError::ProofFailed(
-                "prove task ended before producing descriptors".into(),
-            ))
+            // The task ended before producing descriptors (e.g. MPC
+            // `prover.commit()` setup failed). The REAL error was sent to
+            // result_rx — surface it instead of the generic message, which
+            // previously hid every MPC setup failure cause.
+            return match result_rx.await {
+                Ok(Err(e)) => Err(e),
+                _ => Err(TlsnError::ProofFailed(
+                    "prove task ended before producing descriptors".into(),
+                )),
+            };
         }
     };
 

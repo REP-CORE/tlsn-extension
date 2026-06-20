@@ -802,3 +802,40 @@ async fn test_webhook_integration_with_github() {
 
     info!("Integration test completed successfully!");
 }
+
+/// Device-free repro: run the SAME local MPC prover against the DEPLOYED Fly
+/// notary, through a local TLS bridge (socat ws://127.0.0.1:9444 -> wss://
+/// rep-notary.fly.dev:443). The local in-proc test passes; if THIS fails with
+/// "bytes remaining on stream" / "context mux error", the Fly L7 proxy is
+/// corrupting the MPC mux. Bridge + run:
+///   socat TCP-LISTEN:9444,fork,reuseaddr OPENSSL:rep-notary.fly.dev:443,verify=0 &
+///   FLY_BRIDGE=ws://127.0.0.1:9444 cargo test -p tlsn-verifier-server fly_mpc_repro -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn fly_mpc_repro() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
+    let base = std::env::var("FLY_BRIDGE").unwrap_or_else(|_| "ws://127.0.0.1:9444".to_string());
+    info!("[fly-repro] base={}", base);
+
+    let mut session = SessionClient::connect(&base)
+        .await
+        .expect("session connect (bridge up?)");
+    let session_id = session
+        .register(MAX_RECV_DATA, MAX_SENT_DATA, HashMap::new())
+        .await
+        .expect("register");
+    info!("[fly-repro] session registered: {}", session_id);
+
+    let verifier_ws_url = format!("{}/verifier?sessionId={}", base, session_id);
+    let proxy_url = format!("{}/proxy?token=raw.githubusercontent.com", base);
+
+    let result = run_prover(verifier_ws_url, proxy_url, MAX_SENT_DATA, MAX_RECV_DATA).await;
+    match &result {
+        Ok((s, r)) => info!("[fly-repro] ✅ MPC SUCCEEDED over Fly: sent={} recv={}", s.len(), r.len()),
+        Err(e) => info!("[fly-repro] ❌ MPC FAILED over Fly: {}", e),
+    }
+    assert!(result.is_ok(), "MPC over Fly failed: {:?}", result.err());
+}
