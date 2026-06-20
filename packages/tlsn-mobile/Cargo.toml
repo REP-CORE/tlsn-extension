@@ -17,13 +17,13 @@ path = "uniffi-bindgen.rs"
 # For local development, override with a path in Cargo.toml:
 #   [patch."https://github.com/tlsnotary/tlsn.git"]
 #   tlsn-sdk-core = { path = "../tlsn-wasm/tlsn/crates/sdk-core" }
-tlsn-sdk-core = { git = "https://github.com/tlsnotary/tlsn.git", tag = "v0.1.0-alpha.15", features = ["mozilla-certs"] }
+tlsn-sdk-core = { git = "https://github.com/REP-CORE/tlsn.git", branch = "rep-raise-mux-streams", features = ["mozilla-certs"] }
 
 # Notary mode (signed presentations): high-level tlsn prover/attestation API +
 # HTTP transcript formats. sdk-core only does interactive reveal, so notarize()
 # uses these directly. Same tag as sdk-core.
-tlsn = { git = "https://github.com/tlsnotary/tlsn.git", tag = "v0.1.0-alpha.15", features = ["mozilla-certs"] }
-tlsn-formats = { git = "https://github.com/tlsnotary/tlsn.git", tag = "v0.1.0-alpha.15" }
+tlsn = { git = "https://github.com/REP-CORE/tlsn.git", branch = "rep-raise-mux-streams", features = ["mozilla-certs"] }
+tlsn-formats = { git = "https://github.com/REP-CORE/tlsn.git", branch = "rep-raise-mux-streams" }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
