@@ -10,7 +10,7 @@
 //! Attestation requires MPC mode (the notary stays blind to plaintext). Modelled
 //! on tlsn `examples/attestation/{prove,present}.rs`.
 
-use crate::{ws_io::WsIoAdapter, HttpRequest, ProverOptions, TlsnError};
+use crate::{ws_io::WsIoAdapter, HandlerPart, HttpRequest, ProverOptions, TlsnError};
 use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -146,30 +146,63 @@ pub async fn notarize_async(
         .map_err(|e| proof_err(format!("prover join: {e}")))?
         .map_err(conn_err)?;
 
-    // Commit the RAW transcript as byte ranges. HttpTranscript::parse needs a
-    // UTF-8 body, but the MPC response is gzipped (binary) so the HTTP committer
-    // chokes ("invalid utf-8"). Commit raw ranges instead. Hash commitments are
-    // per-range, so commit the request LINE separately from the request HEADERS —
-    // that lets the presentation reveal the line (what was asked) while hiding the
-    // headers (session cookies / auth). recv is committed whole and revealed whole.
+    // Commit the transcript as RAW byte ranges (HttpTranscript::parse wants UTF-8).
+    // Hash commitments are per-range. SELECTIVE DISCLOSURE is the key to scaling:
+    // the dominant on-device cost is the in-ZK hash commitment over COMMITTED bytes
+    // (commit/hash.rs runs a SHA/BLAKE circuit per 64 B through the notary). So if
+    // the caller passes a recv reveal regex (in handlers), we commit + reveal ONLY
+    // the matching byte ranges (the "amount" substrings) — collapsing prove() from
+    // thousands of hash blocks over a 256 KB ledger to a handful. Plaintext required
+    // (regex can't match gzipped bytes), so the Swift side sends identity encoding.
+    // No regex (small responses like Uber) → commit/reveal the whole recv.
+    // Request: commit the request LINE separately from the HEADERS so the line is
+    // revealed (what was asked) while cookies/auth stay redacted ('X').
     let sent_len = prover.transcript().sent().len();
     let recv_len = prover.transcript().received().len();
-    info!(
-        "notarize: transcript sizes sent={} recv={} (recv is the gzipped wire response)",
-        sent_len, recv_len
-    );
     let reqline_end = prover
         .transcript()
         .sent()
         .windows(2)
         .position(|w| w == b"\r\n")
         .unwrap_or(sent_len);
+
+    let recv_regex: Option<String> = options.handlers.iter().find_map(|h| {
+        if matches!(h.part, HandlerPart::All) {
+            h.params.as_ref().and_then(|p| p.regex.clone())
+        } else {
+            None
+        }
+    });
+    let recv_ranges: Vec<std::ops::Range<usize>> = match &recv_regex {
+        Some(rx) => {
+            let re = regex::bytes::Regex::new(rx).map_err(cfg_err)?;
+            let recv = prover.transcript().received();
+            let mut rs: Vec<std::ops::Range<usize>> = Vec::new();
+            // status line (first line) for proof context: "HTTP/1.1 200 OK"
+            if let Some(nl) = recv.windows(2).position(|w| w == b"\r\n") {
+                rs.push(0..nl);
+            }
+            for m in re.find_iter(recv) {
+                rs.push(m.start()..m.end());
+            }
+            rs
+        }
+        None => vec![0..recv_len],
+    };
+    let committed_bytes: usize = recv_ranges.iter().map(|r| r.len()).sum();
+    info!(
+        "notarize: transcript sent={} recv={}; committing {} recv range(s) = {} bytes (selective={})",
+        sent_len, recv_len, recv_ranges.len(), committed_bytes, recv_regex.is_some()
+    );
+
     let mut commit_builder = TranscriptCommitConfig::builder(prover.transcript());
     commit_builder.commit_sent(0..reqline_end).map_err(cfg_err)?;
     if reqline_end < sent_len {
         commit_builder.commit_sent(reqline_end..sent_len).map_err(cfg_err)?;
     }
-    commit_builder.commit_recv(0..recv_len).map_err(cfg_err)?;
+    for r in &recv_ranges {
+        commit_builder.commit_recv(r.clone()).map_err(cfg_err)?;
+    }
     let transcript_commit = commit_builder.build().map_err(cfg_err)?;
 
     let mut req_cfg_builder = RequestConfig::builder();
@@ -244,13 +277,16 @@ pub async fn notarize_async(
     let provider = CryptoProvider::default();
     att_request.validate(&attestation, &provider).map_err(proof_err)?;
 
-    // Build the Presentation with RAW ranges (HttpTranscript can't parse the
-    // gzipped recv). Reveal the WHOLE response (the verifier decompresses it) and
-    // ONLY the request line of the request — the session cookies / auth headers
-    // stay redacted as 'X'. reqline_end / recv_len were computed at commit time.
+    // Reveal EXACTLY the committed ranges: the request line (cookies/auth stay 'X')
+    // and the selected recv ranges (status line + the matched "amount" substrings,
+    // or the whole recv when no regex). The verifier sums the revealed amounts;
+    // amounts are authenticated as server-origin, so none can be forged — sound for
+    // tiered spend (the prover reveals all real amounts to maximize the total).
     let mut pb = secrets.transcript_proof_builder();
     pb.reveal_sent(0..reqline_end).map_err(proof_err)?;
-    pb.reveal_recv(0..recv_len).map_err(proof_err)?;
+    for r in &recv_ranges {
+        pb.reveal_recv(r.clone()).map_err(proof_err)?;
+    }
     let transcript_proof = pb.build().map_err(proof_err)?;
 
     let mut present_builder = attestation.presentation_builder(&provider);
