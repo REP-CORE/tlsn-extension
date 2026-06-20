@@ -32,7 +32,6 @@ use tlsn::{
     webpki::RootCertStore,
     Session,
 };
-use tlsn_formats::http::{DefaultHttpCommitter, HttpCommit, HttpTranscript};
 use tokio_tungstenite::connect_async;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::info;
@@ -147,12 +146,26 @@ pub async fn notarize_async(
         .map_err(|e| proof_err(format!("prover join: {e}")))?
         .map_err(conn_err)?;
 
-    // Commit to the full transcript (DefaultHttpCommitter), reveal a subset later.
-    let transcript = HttpTranscript::parse(prover.transcript()).map_err(proof_err)?;
+    // Commit the RAW transcript as byte ranges. HttpTranscript::parse needs a
+    // UTF-8 body, but the MPC response is gzipped (binary) so the HTTP committer
+    // chokes ("invalid utf-8"). Commit raw ranges instead. Hash commitments are
+    // per-range, so commit the request LINE separately from the request HEADERS —
+    // that lets the presentation reveal the line (what was asked) while hiding the
+    // headers (session cookies / auth). recv is committed whole and revealed whole.
+    let sent_len = prover.transcript().sent().len();
+    let recv_len = prover.transcript().received().len();
+    let reqline_end = prover
+        .transcript()
+        .sent()
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(sent_len);
     let mut commit_builder = TranscriptCommitConfig::builder(prover.transcript());
-    DefaultHttpCommitter::default()
-        .commit_transcript(&mut commit_builder, &transcript)
-        .map_err(proof_err)?;
+    commit_builder.commit_sent(0..reqline_end).map_err(cfg_err)?;
+    if reqline_end < sent_len {
+        commit_builder.commit_sent(reqline_end..sent_len).map_err(cfg_err)?;
+    }
+    commit_builder.commit_recv(0..recv_len).map_err(cfg_err)?;
     let transcript_commit = commit_builder.build().map_err(cfg_err)?;
 
     let mut req_cfg_builder = RequestConfig::builder();
@@ -225,26 +238,13 @@ pub async fn notarize_async(
     let provider = CryptoProvider::default();
     att_request.validate(&attestation, &provider).map_err(proof_err)?;
 
-    // Build the Presentation: reveal the full response (the platform data has no
-    // secrets) + the request structure with sensitive headers redacted.
-    let http_t = HttpTranscript::parse(secrets.transcript()).map_err(proof_err)?;
+    // Build the Presentation with RAW ranges (HttpTranscript can't parse the
+    // gzipped recv). Reveal the WHOLE response (the verifier decompresses it) and
+    // ONLY the request line of the request — the session cookies / auth headers
+    // stay redacted as 'X'. reqline_end / recv_len were computed at commit time.
     let mut pb = secrets.transcript_proof_builder();
-    let req0 = &http_t.requests[0];
-    pb.reveal_sent(req0.without_data()).map_err(proof_err)?;
-    pb.reveal_sent(&req0.request.target).map_err(proof_err)?;
-    for header in &req0.headers {
-        let name = header.name.as_str();
-        if name.eq_ignore_ascii_case("cookie")
-            || name.eq_ignore_ascii_case("authorization")
-            || name.eq_ignore_ascii_case("x-csrf-token")
-        {
-            pb.reveal_sent(header.without_value()).map_err(proof_err)?;
-        } else {
-            pb.reveal_sent(header).map_err(proof_err)?;
-        }
-    }
-    let resp0 = &http_t.responses[0];
-    pb.reveal_recv(resp0).map_err(proof_err)?;
+    pb.reveal_sent(0..reqline_end).map_err(proof_err)?;
+    pb.reveal_recv(0..recv_len).map_err(proof_err)?;
     let transcript_proof = pb.build().map_err(proof_err)?;
 
     let mut present_builder = attestation.presentation_builder(&provider);
