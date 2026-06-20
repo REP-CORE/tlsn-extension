@@ -198,13 +198,21 @@ pub async fn notarize_async(
         .map_err(|e| proof_err(format!("driver join: {e}")))?
         .map_err(conn_err)?;
     let request_bytes = bincode::serialize(&att_request).map_err(proof_err)?;
+    // Length-prefixed exchange. A WebSocket has NO TCP half-close: socket.close()
+    // tears down BOTH directions, so the old "write request -> close -> read_to_end
+    // attestation" deadlocks (the notary can't write back; we can't read). Frame
+    // each side with a u32 BE length and never close mid-exchange.
+    let req_len = (request_bytes.len() as u32).to_be_bytes();
+    socket.write_all(&req_len).await.map_err(conn_err)?;
     socket.write_all(&request_bytes).await.map_err(conn_err)?;
-    socket.close().await.map_err(conn_err)?;
-    let mut attestation_bytes = Vec::new();
-    socket
-        .read_to_end(&mut attestation_bytes)
-        .await
-        .map_err(conn_err)?;
+    socket.flush().await.map_err(conn_err)?;
+
+    let mut att_len_buf = [0u8; 4];
+    socket.read_exact(&mut att_len_buf).await.map_err(conn_err)?;
+    let att_len = u32::from_be_bytes(att_len_buf) as usize;
+    let mut attestation_bytes = vec![0u8; att_len];
+    socket.read_exact(&mut attestation_bytes).await.map_err(conn_err)?;
+    let _ = socket.close().await; // best-effort, AFTER the full exchange
     let attestation: Attestation = bincode::deserialize(&attestation_bytes).map_err(proof_err)?;
 
     // Check the attestation matches the prover's view.

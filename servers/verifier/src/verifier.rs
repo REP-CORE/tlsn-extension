@@ -323,10 +323,19 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .map_err(|e| eyre!("Driver join failed: {}", e))?
         .map_err(|e| eyre!("Session driver error: {}", e))?;
 
-    // Receive the attestation request from the prover (bincode over the raw socket).
-    let mut request_bytes = Vec::new();
+    // Receive the attestation request from the prover. Length-prefixed (u32 BE),
+    // NOT read_to_end: a WebSocket has no half-close, so the prover keeps the
+    // connection open and frames the request by length. read_to_end would block
+    // forever (no EOF) or, if the prover closed, kill our write-back below.
+    let mut req_len_buf = [0u8; 4];
     socket
-        .read_to_end(&mut request_bytes)
+        .read_exact(&mut req_len_buf)
+        .await
+        .map_err(|e| eyre!("Failed to read attestation request length: {}", e))?;
+    let req_len = u32::from_be_bytes(req_len_buf) as usize;
+    let mut request_bytes = vec![0u8; req_len];
+    socket
+        .read_exact(&mut request_bytes)
         .await
         .map_err(|e| eyre!("Failed to read attestation request: {}", e))?;
     let request: AttestationRequest = bincode::deserialize(&request_bytes)
@@ -379,14 +388,21 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     let attestation_bytes =
         bincode::serialize(&attestation).map_err(|e| eyre!("Failed to serialize attestation: {}", e))?;
+    // Length-prefixed write back (matches the prover's length-prefixed read).
+    let att_len = (attestation_bytes.len() as u32).to_be_bytes();
+    socket
+        .write_all(&att_len)
+        .await
+        .map_err(|e| eyre!("Failed to send attestation length: {}", e))?;
     socket
         .write_all(&attestation_bytes)
         .await
         .map_err(|e| eyre!("Failed to send attestation: {}", e))?;
     socket
-        .close()
+        .flush()
         .await
-        .map_err(|e| eyre!("Failed to close socket: {}", e))?;
+        .map_err(|e| eyre!("Failed to flush attestation: {}", e))?;
+    let _ = socket.close().await; // best-effort, AFTER the full write
 
     info!(
         "Notary: signed attestation sent ({} bytes)",
