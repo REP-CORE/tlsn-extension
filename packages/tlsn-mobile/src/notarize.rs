@@ -12,7 +12,7 @@
 
 use crate::{ws_io::WsIoAdapter, HttpRequest, ProverOptions, TlsnError};
 use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use http_body_util::Empty;
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use std::future::IntoFuture;
@@ -127,8 +127,14 @@ pub async fn notarize_async(
     for h in &request.headers {
         req_builder = req_builder.header(h.name.as_str(), h.value.as_str());
     }
+    // Send the REAL request body (POST/PUT). Hardcoding an empty body dropped the
+    // payload: Uber getOrderCount (35B POST body) hit a server error
+    // ("n?.filter is not a function") so the MPC proof captured a FAILURE response
+    // (value 0) while the proxy proof — which sends the body — got the real value.
+    // Full with empty bytes is an empty body, so this also covers GET.
+    let body_bytes = Bytes::from(request.body.clone().unwrap_or_default().into_bytes());
     let http_request = req_builder
-        .body(Empty::<Bytes>::new())
+        .body(Full::<Bytes>::new(body_bytes))
         .map_err(|e| conn_err(format!("build request: {e}")))?;
     let response = request_sender
         .send_request(http_request)
@@ -356,7 +362,7 @@ mod fly_repro_tests {
         };
         let options = ProverOptions {
             verifier_url: base,
-            max_sent_data: 4096,
+            max_sent_data: 8192,
             max_recv_data: 16384,
             handlers: vec![],
             mode: None,
