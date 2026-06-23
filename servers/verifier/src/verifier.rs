@@ -208,9 +208,12 @@ fn bytes_to_redacted_string(bytes: &[u8], to: &str) -> Result<String, eyre::ErrR
 /// (interactive — prover reveals plaintext to us), here the prover commits but
 /// does NOT reveal, so the notary stays blind to the plaintext.
 ///
-/// secp256k1 signing key from env `NOTARY_SIGNING_KEY` (32-byte hex). Attestation
-/// requires MPC mode; Proxy is rejected. Modelled on tlsn `examples/attestation/
-/// prove.rs` (the notary half).
+/// secp256k1 signing key from env `NOTARY_SIGNING_KEY` (32-byte hex). Works in
+/// BOTH commitment modes — MPC (device connects) and Proxy (we connect + relay
+/// ciphertext, faster, blind to plaintext but not to the server). Both arms
+/// converge on the same `Committed` state, so the signing path below is
+/// mode-agnostic. Modelled on tlsn `examples/attestation/prove.rs` (the notary
+/// half), which rejects Proxy as an example choice — not a protocol limit.
 pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     socket: T,
     max_sent_data: usize,
@@ -265,10 +268,28 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
                 .await
                 .map_err(|e| eyre!("Run failed: {}", e))?
         }
-        VerifierCommitStart::Proxy(_verifier) => {
-            return Err(eyre!(
-                "notary mode requires MPC-TLS; prover requested Proxy"
-            ));
+        VerifierCommitStart::Proxy(verifier) => {
+            // Proxy mode: WE open the TLS connection to the server and relay
+            // ciphertext between prover and server. The prover still commits
+            // and does NOT reveal, so we stay blind to the plaintext — the
+            // attestation that comes out is identical to the MPC one. Mirrors
+            // the interactive verifier's Proxy branch above.
+            let host = verifier.config().server_name().as_str().to_string();
+            info!("Notary accepting Proxy commitment for server: {}", host);
+
+            let server_addr = format!("{}:443", host);
+            let server_stream = tokio::net::TcpStream::connect(&server_addr)
+                .await
+                .map_err(|e| eyre!("Failed to connect to target server {}: {}", server_addr, e))?;
+            info!("Notary connected to target server {}", server_addr);
+
+            verifier
+                .accept()
+                .await
+                .map_err(|e| eyre!("Accept failed: {}", e))?
+                .run(server_stream.compat())
+                .await
+                .map_err(|e| eyre!("Run failed: {}", e))?
         }
     };
 
