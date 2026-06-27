@@ -1,3 +1,4 @@
+mod present_verify;
 mod verifier;
 mod ws;
 
@@ -9,7 +10,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     serve::ListenerExt,
     Router,
 };
@@ -68,6 +69,10 @@ async fn main() {
         .route("/verifier", get(verifier_ws_handler))
         .route("/proxy", get(proxy_ws_handler))
         .route("/notary", get(notary_ws_handler))
+        .route(
+            "/verify-presentation",
+            post(present_verify::verify_presentation_handler),
+        )
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
