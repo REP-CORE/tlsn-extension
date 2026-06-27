@@ -28,10 +28,16 @@ cargo run --bin uniffi-bindgen -- generate \
 echo "Creating XCFramework..."
 rm -rf target/TlsnMobile.xcframework
 
-# Create module map
-mkdir -p target/headers
-cp target/swift/tlsn_mobileFFI.h target/headers/
-cp target/swift/tlsn_mobileFFI.modulemap target/headers/module.modulemap
+# Create module map. Nest the header + modulemap under a module-named subdir
+# (tlsn_mobileFFI/) instead of the Headers root. A static-library xcframework with
+# Headers/module.modulemap gets copied to BUILT_PRODUCTS_DIR/include/module.modulemap;
+# if the app links a SECOND such xcframework (e.g. XMTP's LibXMTPSwiftFFI), both
+# target the same include/module.modulemap and the build fails with
+# "Multiple commands produce .../include/module.modulemap". Nesting moves ours to
+# include/tlsn_mobileFFI/module.modulemap so they no longer collide.
+mkdir -p target/headers/tlsn_mobileFFI
+cp target/swift/tlsn_mobileFFI.h target/headers/tlsn_mobileFFI/
+cp target/swift/tlsn_mobileFFI.modulemap target/headers/tlsn_mobileFFI/module.modulemap
 
 # Create XCFramework with both architectures
 xcodebuild -create-xcframework \
