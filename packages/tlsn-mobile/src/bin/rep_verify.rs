@@ -11,32 +11,69 @@
 //!             trust the notary only to have been INDEPENDENT of the prover (it is
 //!             blind to your plaintext), and you pin its key to assert that.
 //!
-//!   cargo run -p tlsn-mobile --bin rep-verify -- <presentation.bin> [notary_pubkey_hex]
+//!   cargo run -p tlsn-mobile --bin rep-verify -- <presentation.bin> [notary_pubkey_hex] [--json]
+//!
+//! `--json` emits a single machine-readable object on stdout (nothing else) so a
+//! relying party (rep-mcp issuance/verify) can bind a credential to the proof:
+//!   {"key_matches":bool,"server_name":str,"time_secs":n,"notary_key":hex,
+//!    "recv":str,"sent":str,"facts":[str]}
+//! Exit code is SUCCESS iff the presentation verified AND the pinned key matched.
 
 use std::process::ExitCode;
 
 const DEFAULT_NOTARY_KEY: &str =
     "02114d7e15cb2a93ad88997af3394d00008dae381b601f31379d638de492ab25ef";
 
+fn extract_facts(recv: &str) -> Vec<String> {
+    // Undisclosed bytes are runs of 'X'; split on runs (>=2) so a stray single 'X'
+    // in real text (e.g. "X-Frame-Options") is preserved.
+    let redaction = regex::Regex::new("X{2,}").unwrap();
+    redaction
+        .split(recv)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "HTTP/1.1 200 OK")
+        .map(|s| s.replace('\n', " ").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let Some(path) = args.get(1) else {
-        eprintln!("usage: rep-verify <presentation.bin> [notary_pubkey_hex]");
+    let json = args.iter().any(|a| a == "--json");
+    let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
+
+    let Some(path) = positional.first() else {
+        eprintln!("usage: rep-verify <presentation.bin> [notary_pubkey_hex] [--json]");
         return ExitCode::FAILURE;
     };
-    let key = args.get(2).map(String::as_str).unwrap_or(DEFAULT_NOTARY_KEY);
+    let key = positional.get(1).map(|s| s.as_str()).unwrap_or(DEFAULT_NOTARY_KEY);
 
-    let bytes = match std::fs::read(path) {
+    let bytes = match std::fs::read(path.as_str()) {
         Ok(b) => b,
         Err(e) => { eprintln!("cannot read {path}: {e}"); return ExitCode::FAILURE; }
     };
 
-    println!("REP offline proof verifier");
-    println!("  presentation: {path} ({} bytes)", bytes.len());
-    println!("  no network — pure local crypto over the signed bytes\n");
-
     match tlsn_mobile::verify_presentation(bytes, key.to_string()) {
         Ok(v) => {
+            let facts = extract_facts(&v.recv);
+            if json {
+                // Machine-readable: one JSON object, nothing else on stdout.
+                let out = serde_json::json!({
+                    "key_matches": v.key_matches,
+                    "server_name": v.server_name,
+                    "time_secs": v.time_secs,
+                    "notary_key": v.notary_key,
+                    "expected_key": key,
+                    "recv": v.recv,
+                    "sent": v.sent,
+                    "facts": facts,
+                });
+                println!("{out}");
+                return if v.key_matches { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+            }
+            println!("REP offline proof verifier");
+            println!("  presentation: {path} ({} bytes)", v.recv.len());
+            println!("  no network — pure local crypto over the signed bytes\n");
             // Guarantee 2 first: was the prover able to forge?
             println!("[2] INTEGRITY — could the author have faked this?");
             if v.key_matches {
@@ -54,18 +91,6 @@ fn main() -> ExitCode {
             println!("\n[1] WHO — where did the data come from?");
             println!("    server (proven by its real TLS certificate): {}", v.server_name);
             println!("    connection time (unix): {}", v.time_secs);
-
-            // The proven facts: revealed substrings. Undisclosed bytes are runs of
-            // 'X' (redaction); split on those runs, not on stray single 'X' that
-            // occur in real text (e.g. "X-Frame-Options").
-            let redaction = regex::Regex::new("X{2,}").unwrap();
-            let facts: Vec<String> = redaction
-                .split(&v.recv)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty() && *s != "HTTP/1.1 200 OK")
-                .map(|s| s.replace('\n', " ").trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
             println!("\n[3] PROVEN FACTS — revealed bytes, authenticated as server-origin:");
             if facts.is_empty() {
                 println!("    (whole response revealed — see raw recv)");
@@ -76,6 +101,10 @@ fn main() -> ExitCode {
             println!("\n✅ VERIFIED. Two independent guarantees hold; trust the math, not REP.");
             ExitCode::SUCCESS
         }
-        Err(e) => { println!("❌ INVALID presentation: {e}"); ExitCode::FAILURE }
+        Err(e) => {
+            if json { println!("{}", serde_json::json!({ "error": e.to_string() })); }
+            else { println!("❌ INVALID presentation: {e}"); }
+            ExitCode::FAILURE
+        }
     }
 }

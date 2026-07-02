@@ -66,3 +66,7 @@ default = []
 [[bin]]
 name = "rep-verify"
 path = "src/bin/rep_verify.rs"
+
+[[bin]]
+name = "gen-presentation"
+path = "src/bin/gen_presentation.rs"
