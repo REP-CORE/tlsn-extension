@@ -7,10 +7,17 @@
 //! the transcript, request a signed `Attestation`, and build a `Presentation`
 //! that anyone can verify offline against the notary's public key + WebPKI.
 //!
-//! Attestation requires MPC mode (the notary stays blind to plaintext). Modelled
-//! on tlsn `examples/attestation/{prove,present}.rs`.
+//! Two transports produce the attestation, chosen by `options.mode`:
+//!   - MPC: the device dials the server directly and co-computes the TLS with the
+//!     notary (notary stays blind to plaintext). Strongest privacy.
+//!   - Proxy: the NOTARY dials the server and observes the TLS (portable-proxy).
+//!     The notary sees plaintext, but the server sees the NOTARY's IP — which
+//!     dodges per-device rate limits (e.g. Spotify 429). notary() accepts Proxy
+//!     mode as of the verifier's 69048d2.
+//! Modelled on tlsn `examples/attestation/{prove,present}.rs` + sdk-core's
+//! ProxyTlsConfig setup path.
 
-use crate::{ws_io::WsIoAdapter, HandlerPart, HttpRequest, ProverOptions, TlsnError};
+use crate::{ws_io::WsIoAdapter, HandlerPart, HttpRequest, Mode, ProverOptions, TlsnError};
 use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -24,7 +31,7 @@ use tlsn::{
     },
     config::{
         prove::ProveConfig, prover::ProverConfig, tls::TlsClientConfig,
-        tls_commit::mpc::MpcTlsConfig,
+        tls_commit::mpc::MpcTlsConfig, tls_commit::proxy::ProxyTlsConfig,
     },
     connection::{HandshakeData, ServerName},
     prover::ProverOutput,
@@ -80,38 +87,63 @@ pub async fn notarize_async(
     let (driver, mut handle) = session.split();
     let driver_task = tokio::spawn(driver);
 
-    // New MPC prover.
-    let prover = handle
-        .new_prover(ProverConfig::builder().build().map_err(cfg_err)?)
-        .map_err(conn_err)?
-        .commit(
-            MpcTlsConfig::builder()
-                .max_sent_data(options.max_sent_data as usize)
-                .max_recv_data(options.max_recv_data as usize)
-                .build()
-                .map_err(cfg_err)?,
-        )
-        .await
-        .map_err(conn_err)?;
-
-    // TLS to the real server (residential IP = the device).
-    let server_socket = tokio::net::TcpStream::connect((host.as_str(), 443))
-        .await
-        .map_err(|e| conn_err(format!("server connect {host}: {e}")))?;
-    let (tls_connection, prover) = prover
-        .connect(
-            TlsClientConfig::builder()
-                .server_name(ServerName::Dns(
-                    host.as_str().try_into().map_err(|_| conn_err("bad server name"))?,
-                ))
-                .root_store(RootCertStore::mozilla())
-                .build()
-                .map_err(cfg_err)?,
-            server_socket.compat(),
-        )
-        .map_err(conn_err)?;
+    // Commit + connect, by transport. The prover re-converges on the SAME
+    // `state::Committed` after either connect, so everything downstream (prove,
+    // attestation request, the reclaimed-socket exchange, presentation) is
+    // mode-agnostic and unchanged — only the commit config + connect differ.
+    //   MPC  : device dials the server directly (residential IP); notary blind.
+    //   PROXY: NOTARY dials the server and relays over the mux (notary IP + sees
+    //          plaintext) → portable-proxy. The server sees the notary's IP, so
+    //          per-device rate limits (Spotify 429) don't apply. Needs no
+    //          max_sent/recv sizing (the MPC machine isn't built).
+    // Each branch spawns into_future() itself: `Prover<Connected<S>>` has a
+    // different S per transport (mux Stream vs TcpStream), but the spawned
+    // `Prover<Committed>` is one type, so the tuple unifies.
+    let tls_config = TlsClientConfig::builder()
+        .server_name(ServerName::Dns(
+            host.as_str().try_into().map_err(|_| conn_err("bad server name"))?,
+        ))
+        .root_store(RootCertStore::mozilla())
+        .build()
+        .map_err(cfg_err)?;
+    let (tls_connection, prover_task) = if matches!(options.mode, Some(Mode::Proxy)) {
+        let prover = handle
+            .new_prover(ProverConfig::builder().build().map_err(cfg_err)?)
+            .map_err(conn_err)?
+            .commit(
+                ProxyTlsConfig::builder()
+                    .server_name(host.as_str().try_into().map_err(|_| conn_err("bad server name"))?)
+                    .build()
+                    .map_err(cfg_err)?,
+            )
+            .await
+            .map_err(conn_err)?;
+        // No server socket — the notary opens the connection and relays it.
+        let (tls_conn, prover) = prover.connect(tls_config).map_err(conn_err)?;
+        (tls_conn, tokio::spawn(prover.into_future()))
+    } else {
+        let prover = handle
+            .new_prover(ProverConfig::builder().build().map_err(cfg_err)?)
+            .map_err(conn_err)?
+            .commit(
+                MpcTlsConfig::builder()
+                    .max_sent_data(options.max_sent_data as usize)
+                    .max_recv_data(options.max_recv_data as usize)
+                    .build()
+                    .map_err(cfg_err)?,
+            )
+            .await
+            .map_err(conn_err)?;
+        // TLS to the real server (residential IP = the device).
+        let server_socket = tokio::net::TcpStream::connect((host.as_str(), 443))
+            .await
+            .map_err(|e| conn_err(format!("server connect {host}: {e}")))?;
+        let (tls_conn, prover) = prover
+            .connect(tls_config, server_socket.compat())
+            .map_err(conn_err)?;
+        (tls_conn, tokio::spawn(prover.into_future()))
+    };
     let tls_connection = TokioIo::new(tls_connection.compat());
-    let prover_task = tokio::spawn(prover.into_future());
 
     // HTTP/1.1 over the proven TLS connection.
     let (mut request_sender, connection) = hyper::client::conn::http1::handshake(tls_connection)
