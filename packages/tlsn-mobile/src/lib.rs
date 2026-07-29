@@ -14,6 +14,49 @@ use std::sync::{Mutex, OnceLock};
 
 uniffi::setup_scaffolding!();
 
+// ── REP context-graph FFI (HANDOFF/05 Task A) ──────────────────────────────
+// Deterministic wrappers over the frozen rep-identity / rep-commit crates so the phone derives
+// its graph identity + commits the proven value LOCALLY (the raw value never leaves the device).
+// Byte params/returns are 32-byte arrays as Vec<u8>; commit takes the value in integer cents.
+fn rep_b32(v: &[u8]) -> [u8; 32] {
+    let mut a = [0u8; 32];
+    let n = v.len().min(32);
+    a[..n].copy_from_slice(&v[..n]);
+    a
+}
+
+#[uniffi::export]
+pub fn rep_master_secret(authenticator_secret: Vec<u8>) -> Vec<u8> {
+    rep_identity::master_secret(&authenticator_secret).to_vec()
+}
+
+#[uniffi::export]
+pub fn rep_identity_secret(master: Vec<u8>) -> Vec<u8> {
+    rep_identity::identity_secret(&rep_b32(&master)).to_vec()
+}
+
+#[uniffi::export]
+pub fn rep_node_commitment(identity: Vec<u8>) -> Vec<u8> {
+    rep_identity::node_commitment(&rep_b32(&identity)).to_vec()
+}
+
+#[uniffi::export]
+pub fn rep_context_nullifier(identity: Vec<u8>, ctype: u16) -> Vec<u8> {
+    rep_identity::context_nullifier(&rep_b32(&identity), ctype).to_vec()
+}
+
+#[uniffi::export]
+pub fn rep_blinding_seed(identity: Vec<u8>, ctype: u16) -> Vec<u8> {
+    rep_identity::blinding_seed(&rep_b32(&identity), ctype).to_vec()
+}
+
+#[uniffi::export]
+pub fn rep_commit_bn254(v_cents: u64, blinding_seed: Vec<u8>) -> Vec<u8> {
+    use rep_commit::Pedersen;
+    rep_commit::Bn254Pedersen::commit(v_cents, &rep_b32(&blinding_seed)).to_vec()
+}
+// ───────────────────────────────────────────────────────────────────────────
+
 /// Process-wide tokio runtime.
 ///
 /// FFI calls share this runtime so async resources (websockets, TCP streams)
@@ -557,5 +600,77 @@ pub fn prove(
 /// blind to plaintext). Progress is emitted via `tracing` → [`drain_logs`].
 #[uniffi::export]
 pub fn notarize(request: HttpRequest, options: ProverOptions) -> Result<Vec<u8>, TlsnError> {
+    shared_runtime()
+        .block_on(notarize::notarize_async(request, options))
+        .map(|s| s.presentation)
+}
+
+/// The same session, but keeping what a later re-open needs.
+///
+/// [`notarize`] throws away the attestation and the openings the moment it has a
+/// presentation, which fixes the disclosure level forever: the reveal set is
+/// decided when the proof is made, and every presentment afterwards carries the
+/// union of what any consumer might have wanted. This returns them instead, so a
+/// narrower presentation can be built later with [`open_presentation`] — no
+/// notary, no server, no second login.
+///
+/// The caller takes on a real obligation in exchange: `secrets` contains the full
+/// transcript, cookies and bearer tokens included. Store it device-only and
+/// encrypted, or use [`notarize`] and keep nothing.
+#[uniffi::export]
+pub fn notarize_capture(
+    request: HttpRequest,
+    options: ProverOptions,
+) -> Result<notarize::NotarizedSession, TlsnError> {
     shared_runtime().block_on(notarize::notarize_async(request, options))
+}
+
+/// Notarize once and return one presentation per disclosure level, keeping no
+/// plaintext.
+///
+/// The privacy-preferred shape. `notarize_capture` + [`open_presentation`] lets a
+/// level be chosen at any time later, but only if the app stores the full
+/// transcript. This decides the levels up front — which is when a template already
+/// knows them — and returns only signed presentations, so nothing sensitive
+/// survives the call.
+///
+/// `levels` are reveal regexes; `None` means the whole committed response. The
+/// returned vector is in the same order.
+#[uniffi::export]
+pub fn notarize_levels(
+    request: HttpRequest,
+    options: ProverOptions,
+    levels: Vec<Option<String>>,
+) -> Result<Vec<Vec<u8>>, TlsnError> {
+    let session = shared_runtime().block_on(notarize::notarize_async(request, options))?;
+    notarize::presentations_for_levels(&session.attestation, &session.secrets, &levels)
+}
+
+/// Build the levels from an already-captured session, offline.
+///
+/// Same as [`notarize_levels`] without the proving step, for a caller that already
+/// holds an attestation and its secrets.
+#[uniffi::export]
+pub fn presentations_for_levels(
+    attestation: Vec<u8>,
+    secrets: Vec<u8>,
+    levels: Vec<Option<String>>,
+) -> Result<Vec<Vec<u8>>, TlsnError> {
+    notarize::presentations_for_levels(&attestation, &secrets, &levels)
+}
+
+/// Re-open a proof at a narrower disclosure level, offline.
+///
+/// `reveal_regex` selects the recv bytes to open, exactly as a template's reveal
+/// regex does at proof time. Passing `None` opens the whole received transcript.
+/// Only a SUBSET of what was originally committed can be opened; asking for more
+/// fails with the missing byte ranges named, because a proof that quietly revealed
+/// less than asked would be worse than one that refused.
+#[uniffi::export]
+pub fn open_presentation(
+    attestation: Vec<u8>,
+    secrets: Vec<u8>,
+    reveal_regex: Option<String>,
+) -> Result<Vec<u8>, TlsnError> {
+    notarize::open_presentation(&attestation, &secrets, reveal_regex)
 }

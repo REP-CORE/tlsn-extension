@@ -53,11 +53,185 @@ fn proof_err<E: std::fmt::Display>(e: E) -> TlsnError {
     TlsnError::ProofFailed(format!("{e}"))
 }
 
-/// Notarize `request` (MPC) and return a bincode-serialized `Presentation`.
+/// Where the request line ends, so headers (cookies, bearer tokens) can be
+/// committed separately from what was asked and stay redacted.
+fn reqline_end_of(sent: &[u8]) -> usize {
+    sent.windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(sent.len())
+}
+
+/// The recv byte ranges a reveal regex selects: the status line for context, plus
+/// every match.
+///
+/// Shared by commit time and open time ON PURPOSE. These two must agree byte for
+/// byte — a range that was never committed cannot be revealed later, and the
+/// failure would only appear at the moment a user presents a credential. One
+/// function means they cannot drift.
+fn recv_ranges_for(recv: &[u8], regex: Option<&str>) -> Result<Vec<std::ops::Range<usize>>, TlsnError> {
+    let Some(rx) = regex else {
+        return Ok(vec![0..recv.len()]);
+    };
+    let re = regex::bytes::Regex::new(rx).map_err(cfg_err)?;
+    let mut rs: Vec<std::ops::Range<usize>> = Vec::new();
+    // Status line ("HTTP/1.1 200 OK") for proof context.
+    if let Some(nl) = recv.windows(2).position(|w| w == b"\r\n") {
+        rs.push(0..nl);
+    }
+    for m in re.find_iter(recv) {
+        rs.push(m.start()..m.end());
+    }
+    Ok(rs)
+}
+
+/// Build a `Presentation` from an attestation and its secrets, revealing the
+/// request line and the given recv ranges.
+///
+/// Everything here is local and offline: no notary, no server, no TLS. That is the
+/// property the whole re-open path rests on — see [`open_presentation`].
+fn build_presentation(
+    attestation: &Attestation,
+    secrets: &tlsn::attestation::Secrets,
+    recv_ranges: &[std::ops::Range<usize>],
+) -> Result<Vec<u8>, TlsnError> {
+    let reqline_end = reqline_end_of(secrets.transcript().sent());
+    let mut pb = secrets.transcript_proof_builder();
+    pb.reveal_sent(0..reqline_end).map_err(proof_err)?;
+    for r in recv_ranges {
+        // A range outside what was committed cannot be revealed. tlsn names the
+        // missing bytes, so the error is passed through rather than flattened:
+        // "you asked to open something this proof never committed" is the whole
+        // diagnosis, and it is unrecoverable without a new proof.
+        pb.reveal_recv(r.clone()).map_err(proof_err)?;
+    }
+    let transcript_proof = pb.build().map_err(proof_err)?;
+
+    let provider = CryptoProvider::default();
+    let mut present_builder = attestation.presentation_builder(&provider);
+    present_builder
+        .identity_proof(secrets.identity_proof())
+        .transcript_proof(transcript_proof);
+    let presentation = present_builder.build().map_err(proof_err)?;
+    bincode::serialize(&presentation).map_err(proof_err)
+}
+
+/// Build one presentation per disclosure level, at proof time, keeping no
+/// plaintext afterwards.
+///
+/// Same capability as [`open_presentation`], with the storage question removed.
+/// Re-opening later is more flexible, but it requires keeping `secrets`, and
+/// `secrets` is the full transcript — cookies and bearer tokens included. An app
+/// that holds that at rest has taken on a materially different risk than one
+/// holding only signed presentations, and it is hard to distinguish from a
+/// credential stealer to anyone reviewing what the binary keeps.
+///
+/// The levels a template will ever present at are known when the template is
+/// written. So build them all while the secrets are still in memory, hand back the
+/// presentations, and let the secrets die with the call. The cost is that the set
+/// is fixed at proof time; the gain is that there is nothing left to protect.
+///
+/// `levels` are reveal regexes. Every one must select a subset of what was
+/// committed, or the whole call fails — a level that silently revealed less than
+/// its name promises is the failure mode worth being loud about.
+pub fn presentations_for_levels(
+    attestation_bytes: &[u8],
+    secrets_bytes: &[u8],
+    levels: &[Option<String>],
+) -> Result<Vec<Vec<u8>>, TlsnError> {
+    let attestation: Attestation = bincode::deserialize(attestation_bytes).map_err(proof_err)?;
+    let secrets: tlsn::attestation::Secrets =
+        bincode::deserialize(secrets_bytes).map_err(proof_err)?;
+    let recv = secrets.transcript().received();
+    let mut out = Vec::with_capacity(levels.len());
+    for level in levels {
+        let ranges = recv_ranges_for(recv, level.as_deref())?;
+        out.push(build_presentation(&attestation, &secrets, &ranges)?);
+    }
+    info!("levels: built {} presentation(s), secrets not retained", out.len());
+    Ok(out)
+}
+
+/// Re-open an existing proof at a NARROWER disclosure level, on device, offline.
+///
+/// Why this exists. The reveal set is fixed when a proof is created, and it is the
+/// union of everything any disclosure level might need — for a hotel proof that
+/// means the amounts AND the property names. So a partner who asked only for a
+/// spend band still caused the property names to be sent to the attestation
+/// service, because they were in the same presentation. The narrow-the-template
+/// work reduces what is committed; this reduces what is OPENED, per presentment,
+/// which is the part that varies by who is asking.
+///
+/// What makes it cheap: TLSNotary separates commitment from opening. The
+/// attestation is already signed, the commitments are already made, and
+/// `Secrets::transcript_proof_builder` can be called any number of times. A new
+/// presentation costs a hash and a serialization. There is no MPC, no notary
+/// round trip, no second login, and nothing the server can rate-limit.
+///
+/// The constraint, which is tighter than "reveal less" and was found by running
+/// this rather than by reading it: a hash commitment is ATOMIC over its range. An
+/// opening must tile exactly with whole committed ranges, so you can drop entire
+/// committed ranges and nothing else. Opening half of one fails — the range is
+/// reported uncovered — because revealing part of a hash commitment would reveal
+/// the rest of it too.
+///
+/// The practical consequence for templates: commit at the finest granularity you
+/// might ever want to open at. A regex template already does, since every match is
+/// its own committed range, so dropping the property-name matches while keeping the
+/// amount matches works. A template with NO reveal regex commits the whole response
+/// as ONE range and can never be narrowed afterwards — for those, narrowing has to
+/// happen at proof time or not at all.
+///
+/// Widening is impossible in both directions and returns an error naming the
+/// uncovered bytes, rather than a quietly smaller proof.
+///
+/// The cost, also stated plainly: this requires keeping `secrets` on the device,
+/// and `secrets` contains the FULL transcript — cookies and bearer tokens
+/// included. Today they are dropped the moment the presentation is built. Storing
+/// them moves that plaintext into the device's keystore, which is the right
+/// custodian (the user's own hardware rather than our service) but is a real
+/// change in what the app holds at rest, and it must be stored device-only,
+/// non-syncing, and behind biometrics.
+pub fn open_presentation(
+    attestation_bytes: &[u8],
+    secrets_bytes: &[u8],
+    reveal_regex: Option<String>,
+) -> Result<Vec<u8>, TlsnError> {
+    let attestation: Attestation = bincode::deserialize(attestation_bytes).map_err(proof_err)?;
+    let secrets: tlsn::attestation::Secrets =
+        bincode::deserialize(secrets_bytes).map_err(proof_err)?;
+    let ranges = recv_ranges_for(secrets.transcript().received(), reveal_regex.as_deref())?;
+    let opened: usize = ranges.iter().map(|r| r.len()).sum();
+    info!(
+        "open: re-opening offline, {} recv range(s) = {} bytes of {}",
+        ranges.len(),
+        opened,
+        secrets.transcript().received().len()
+    );
+    build_presentation(&attestation, &secrets, &ranges)
+}
+
+/// One notarized session: the presentation to hand out now, plus the material
+/// needed to hand out a NARROWER one later without proving again.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NotarizedSession {
+    /// Bincode `Presentation`, offline-verifiable. The artifact as it exists today.
+    pub presentation: Vec<u8>,
+    /// Bincode `Attestation`: the notary's signature over the commitments.
+    /// Carries no plaintext, so it is safe to store beside the presentation.
+    pub attestation: Vec<u8>,
+    /// Bincode `Secrets`: the openings, which include the FULL transcript —
+    /// cookies and bearer tokens among them. Store device-only and encrypted, or
+    /// discard: a caller who does not want the re-open path should drop this and
+    /// lose nothing else.
+    pub secrets: Vec<u8>,
+}
+
+/// Notarize `request` (MPC) and return the presentation together with the
+/// attestation and secrets behind it.
 pub async fn notarize_async(
     request: HttpRequest,
     options: ProverOptions,
-) -> Result<Vec<u8>, TlsnError> {
+) -> Result<NotarizedSession, TlsnError> {
     // Parse host + path from the target URL.
     let url = url::Url::parse(&request.url).map_err(|e| conn_err(format!("bad url: {e}")))?;
     let host = url
@@ -191,12 +365,7 @@ pub async fn notarize_async(
     // revealed (what was asked) while cookies/auth stay redacted ('X').
     let sent_len = prover.transcript().sent().len();
     let recv_len = prover.transcript().received().len();
-    let reqline_end = prover
-        .transcript()
-        .sent()
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .unwrap_or(sent_len);
+    let reqline_end = reqline_end_of(prover.transcript().sent());
 
     let recv_regex: Option<String> = options.handlers.iter().find_map(|h| {
         if matches!(h.part, HandlerPart::All) {
@@ -205,22 +374,7 @@ pub async fn notarize_async(
             None
         }
     });
-    let recv_ranges: Vec<std::ops::Range<usize>> = match &recv_regex {
-        Some(rx) => {
-            let re = regex::bytes::Regex::new(rx).map_err(cfg_err)?;
-            let recv = prover.transcript().received();
-            let mut rs: Vec<std::ops::Range<usize>> = Vec::new();
-            // status line (first line) for proof context: "HTTP/1.1 200 OK"
-            if let Some(nl) = recv.windows(2).position(|w| w == b"\r\n") {
-                rs.push(0..nl);
-            }
-            for m in re.find_iter(recv) {
-                rs.push(m.start()..m.end());
-            }
-            rs
-        }
-        None => vec![0..recv_len],
-    };
+    let recv_ranges = recv_ranges_for(prover.transcript().received(), recv_regex.as_deref())?;
     let committed_bytes: usize = recv_ranges.iter().map(|r| r.len()).sum();
     info!(
         "notarize: transcript sent={} recv={}; committing {} recv range(s) = {} bytes (selective={})",
@@ -314,22 +468,19 @@ pub async fn notarize_async(
     // or the whole recv when no regex). The verifier sums the revealed amounts;
     // amounts are authenticated as server-origin, so none can be forged — sound for
     // tiered spend (the prover reveals all real amounts to maximize the total).
-    let mut pb = secrets.transcript_proof_builder();
-    pb.reveal_sent(0..reqline_end).map_err(proof_err)?;
-    for r in &recv_ranges {
-        pb.reveal_recv(r.clone()).map_err(proof_err)?;
-    }
-    let transcript_proof = pb.build().map_err(proof_err)?;
-
-    let mut present_builder = attestation.presentation_builder(&provider);
-    present_builder
-        .identity_proof(secrets.identity_proof())
-        .transcript_proof(transcript_proof);
-    let presentation = present_builder.build().map_err(proof_err)?;
-
-    let bytes = bincode::serialize(&presentation).map_err(proof_err)?;
+    let bytes = build_presentation(&attestation, &secrets, &recv_ranges)?;
     info!("notarize: presentation built ({} bytes)", bytes.len());
-    Ok(bytes)
+
+    // The attestation and its secrets are what make a LATER, narrower presentation
+    // possible without another proof session — see `open_presentation`. They are
+    // returned rather than dropped so the caller can decide whether to keep them;
+    // `notarize()` still hands back only the presentation, so nothing that exists
+    // today starts holding a transcript by accident.
+    Ok(NotarizedSession {
+        presentation: bytes,
+        attestation: bincode::serialize(&attestation).map_err(proof_err)?,
+        secrets: bincode::serialize(&secrets).map_err(proof_err)?,
+    })
 }
 
 /// Result of verifying a notary-signed `Presentation` offline.

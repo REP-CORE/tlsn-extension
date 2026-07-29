@@ -32,6 +32,12 @@ http-body-util = "0.1"
 bincode = "1.3"
 hex = "0.4"
 
+# REP context-graph cores (frozen, golden-vector-pinned crates). Exported over UniFFI for the
+# on-device graph write path — see rep-graph/HANDOFF/05-app-agent-e2e.md Task A. Pure compute
+# (blake3 + arkworks-bn254 for commit, blake3 for identity); no I/O.
+rep-commit = { path = "../../../rep-graph/rep-commit" }
+rep-identity = { path = "../../../rep-graph/rep-identity" }
+
 # UniFFI for Swift/Kotlin bindings
 uniffi = { version = "0.28", features = ["cli"] }
 
@@ -70,3 +76,7 @@ path = "src/bin/rep_verify.rs"
 [[bin]]
 name = "gen-presentation"
 path = "src/bin/gen_presentation.rs"
+
+[[bin]]
+name = "reopen-check"
+path = "src/bin/reopen_check.rs"
