@@ -35,6 +35,11 @@ rm -rf target/TlsnMobile.xcframework
 # target the same include/module.modulemap and the build fails with
 # "Multiple commands produce .../include/module.modulemap". Nesting moves ours to
 # include/tlsn_mobileFFI/module.modulemap so they no longer collide.
+# Clean any stale root-level headers from a previous run — a leftover
+# target/headers/module.modulemap ends up at the xcframework Headers root and collides
+# with a second FFI xcframework (XMTP) at include/module.modulemap. Only the NESTED
+# tlsn_mobileFFI/module.modulemap may survive.
+rm -rf target/headers
 mkdir -p target/headers/tlsn_mobileFFI
 cp target/swift/tlsn_mobileFFI.h target/headers/tlsn_mobileFFI/
 cp target/swift/tlsn_mobileFFI.modulemap target/headers/tlsn_mobileFFI/module.modulemap
