@@ -1,0 +1,23 @@
+# Standalone REP verifier — serves the stateless offline /verify-presentation route the chat
+# gatekeeper depends on. Separate app from the prover notary (rep-notary) so it carries zero risk
+# to the working portable-MPC proof flow. No secrets needed: verify checks the presentation's own
+# notary signature against a pubkey passed as a query param.
+app = "rep-verifier"
+primary_region = "fra"
+
+[build]
+  dockerfile = "verifier/Dockerfile"
+
+[env]
+  PORT = "7047"
+
+[http_service]
+  internal_port = 7047
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1024mb"
