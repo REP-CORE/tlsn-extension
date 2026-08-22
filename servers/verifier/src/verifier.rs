@@ -4,7 +4,7 @@ use futures_util::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tlsn::{
     attestation::{
         request::Request as AttestationRequest, signing::Secp256k1Signer, Attestation,
-        AttestationConfig, CryptoProvider,
+        AttestationConfig, CryptoProvider, Extension, InvalidExtension,
     },
     config::verifier::VerifierConfig,
     connection::{CertBinding, ConnectionInfo, DnsName, ServerName, TranscriptLength},
@@ -295,8 +295,13 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     // In notary mode the prover commits but does NOT reveal — take the
     // commitments + TLS metadata, never the plaintext.
+    // REP: also take `server_name`. It is the name the NOTARY verified against
+    // the server's certificate chain during the session — the same field the
+    // interactive verifier reports — and is written under the signed root as
+    // the `rep.host` extension so a circuit can pin the host without X.509.
     let (
         VerifierOutput {
+            server_name,
             transcript_commitments,
             ..
         },
@@ -380,8 +385,30 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     let mut provider = CryptoProvider::default();
     provider.signer.set_signer(signer);
 
+    let attested_host: String = match server_name {
+        Some(ServerName::Dns(d)) => d.as_str().to_string(),
+        _ => return Err(eyre!("notary did not establish a server name for rep.host")),
+    };
     let mut att_config_builder = AttestationConfig::builder();
     att_config_builder.supported_signature_algs(Vec::from_iter(provider.signer.supported_algs()));
+    // REP: the default validator rejects every extension. Admit exactly one —
+    // `rep.host` — and only with the value THIS notary verified. A prover
+    // requesting `rep.host = www.booking.com` on a session with evil.example.com
+    // is refused here, before any attestation exists.
+    {
+        let observed = attested_host.clone();
+        att_config_builder.extension_validator(move |exts: &[Extension]| {
+            for e in exts {
+                if e.id != b"rep.host" {
+                    return Err(InvalidExtension::new("only rep.host is accepted"));
+                }
+                if e.value != observed.as_bytes() {
+                    return Err(InvalidExtension::new("rep.host does not match the notarised host"));
+                }
+            }
+            Ok(())
+        });
+    }
     let att_config = att_config_builder
         .build()
         .map_err(|e| eyre!("Failed to build attestation config: {}", e))?;
@@ -402,7 +429,10 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
             },
         })
         .server_ephemeral_key(binding.server_ephemeral_key.clone())
-        .transcript_commitments(transcript_commitments);
+        .transcript_commitments(transcript_commitments)
+        // REP: bind the verified host under the signed root. If the prover also
+        // requested it, the validator above confirmed the values agree.
+        .extension(Extension { id: b"rep.host".to_vec(), value: attested_host.into_bytes() });
     let attestation = builder
         .build(&provider)
         .map_err(|e| eyre!("Failed to build attestation: {}", e))?;
