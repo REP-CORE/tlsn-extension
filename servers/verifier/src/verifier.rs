@@ -10,7 +10,7 @@ use tlsn::{
     connection::{CertBinding, ConnectionInfo, DnsName, ServerName, TranscriptLength},
     transcript::{ContentType, PartialTranscript, TranscriptCommitment},
     verifier::{VerifierCommitStart, VerifierOutput},
-    webpki::{RootCertStore, ServerCertVerifier},
+    webpki::RootCertStore,
     Session,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -239,6 +239,7 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .new_verifier(verifier_config)
         .map_err(|e| eyre!("Failed to create verifier: {}", e))?;
 
+    let mut proxy_server_name: Option<String> = None;
     let verifier = match verifier
         .commit()
         .await
@@ -276,6 +277,10 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
             // the interactive verifier's Proxy branch above.
             let host = verifier.config().server_name().as_str().to_string();
             info!("Notary accepting Proxy commitment for server: {}", host);
+            // REP: in proxy mode the NOTARY resolves and dials the server, so this
+            // name is its own observation — the only place a notary-mode session can
+            // learn the host, since MPC hands it no certificate chain and no SNI.
+            proxy_server_name = Some(host.clone());
 
             let server_addr = format!("{}:443", host);
             let server_stream = tokio::net::TcpStream::connect(&server_addr)
@@ -396,9 +401,23 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     // that chain below, in the extension validator. A prover asking for
     // `rep.host = www.booking.com` on a session with evil.example.com fails,
     // because evil's certificate does not cover that name.
-    let revealed_host: Option<String> = match server_name {
-        Some(ServerName::Dns(d)) => Some(d.as_str().to_string()),
-        _ => None,
+    // REP: which host this session actually reached.
+    //
+    // In notary mode the prover commits and never reveals, so `VerifierOutput`
+    // carries no server name. MPC hands the notary neither the certificate chain
+    // nor the SNI, so an MPC commit session cannot be attested to a host at all —
+    // it is refused below rather than attested to a name the prover merely claims.
+    // In PROXY mode the notary resolves and dials the server itself, so the name is
+    // its own observation, and the prover still commits without revealing: the
+    // notary stays blind to the plaintext and the attestation is the same shape.
+    let attested_host: String = match (server_name, proxy_server_name) {
+        (Some(ServerName::Dns(d)), _) => d.as_str().to_string(),
+        (None, Some(host)) => host,
+        _ => {
+            return Err(eyre!(
+                "notary cannot attest rep.host for this session: run the commit session in proxy mode (MPC gives the notary no server name)"
+            ));
+        }
     };
 
     let mut att_config_builder = AttestationConfig::builder();
@@ -408,32 +427,19 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     // requesting `rep.host = www.booking.com` on a session with evil.example.com
     // is refused here, before any attestation exists.
     {
-        let revealed = revealed_host.clone();
-        let chain: Vec<_> = tls_transcript.server_cert_chain().unwrap_or(&[]).to_vec();
-        let time = tls_transcript.time();
+        // The default validator rejects every extension. Admit exactly one —
+        // `rep.host` — and only with the value THIS notary observed. A prover
+        // requesting `rep.host = www.booking.com` on a session the notary dialled
+        // to evil.example.com is refused here, before any attestation exists.
+        let observed = attested_host.clone();
         att_config_builder.extension_validator(move |exts: &[Extension]| {
             for e in exts {
                 if e.id != b"rep.host" {
                     return Err(InvalidExtension::new("only rep.host is accepted"));
                 }
-                let host = std::str::from_utf8(&e.value)
-                    .map_err(|_| InvalidExtension::new("rep.host is not utf-8"))?;
-                // If the prover revealed the name, that observation decides.
-                if let Some(observed) = revealed.as_deref() {
-                    if host != observed {
-                        return Err(InvalidExtension::new("rep.host does not match the notarised host"));
-                    }
-                    continue;
+                if e.value != observed.as_bytes() {
+                    return Err(InvalidExtension::new("rep.host does not match the notarised host"));
                 }
-                // Otherwise the certificate the server presented has to cover it.
-                let (ee, intermediates) = chain
-                    .split_first()
-                    .ok_or_else(|| InvalidExtension::new("no server certificate in this session"))?;
-                let name = DnsName::try_from(host)
-                    .map_err(|_| InvalidExtension::new("rep.host is not a valid DNS name"))?;
-                ServerCertVerifier::mozilla()
-                    .verify_server_cert(ee, intermediates, &ServerName::Dns(name), time)
-                    .map_err(|_| InvalidExtension::new("rep.host is not covered by the server certificate"))?;
             }
             Ok(())
         });
@@ -458,16 +464,10 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
             },
         })
         .server_ephemeral_key(binding.server_ephemeral_key.clone())
-        .transcript_commitments(transcript_commitments);
-    // REP: bind the verified host under the signed root. When the prover revealed
-    // the name, the notary states it itself. When it did not (notary mode: commit,
-    // never reveal), the prover's REQUESTED `rep.host` already rides in the
-    // attestation via accept_request — and the validator above only let it through
-    // after checking it against the certificate the server presented. Adding it
-    // again here would duplicate the leaf.
-    if let Some(host) = revealed_host {
-        builder.extension(Extension { id: b"rep.host".to_vec(), value: host.into_bytes() });
-    }
+        .transcript_commitments(transcript_commitments)
+        // REP: bind the host the notary itself observed under the signed root. If the
+        // prover also requested it, the validator above confirmed the values agree.
+        .extension(Extension { id: b"rep.host".to_vec(), value: attested_host.into_bytes() });
     let attestation = builder
         .build(&provider)
         .map_err(|e| eyre!("Failed to build attestation: {}", e))?;
