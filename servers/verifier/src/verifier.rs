@@ -410,14 +410,14 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     // In PROXY mode the notary resolves and dials the server itself, so the name is
     // its own observation, and the prover still commits without revealing: the
     // notary stays blind to the plaintext and the attestation is the same shape.
-    let attested_host: String = match (server_name, proxy_server_name) {
-        (Some(ServerName::Dns(d)), _) => d.as_str().to_string(),
-        (None, Some(host)) => host,
-        _ => {
-            return Err(eyre!(
-                "notary cannot attest rep.host for this session: run the commit session in proxy mode (MPC gives the notary no server name)"
-            ));
-        }
+    let attested_host: Option<String> = match (server_name, proxy_server_name) {
+        (Some(ServerName::Dns(d)), _) => Some(d.as_str().to_string()),
+        (None, Some(host)) => Some(host),
+        // An MPC notary session simply has no host to attest. That is not an error:
+        // it is every ordinary notarisation, which never asked for rep.host. The leaf
+        // is omitted, and a prover that DID request rep.host is refused by the
+        // validator below — so a circuit can still never be handed an unattested host.
+        _ => None,
     };
 
     let mut att_config_builder = AttestationConfig::builder();
@@ -437,6 +437,11 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
                 if e.id != b"rep.host" {
                     return Err(InvalidExtension::new("only rep.host is accepted"));
                 }
+                let Some(observed) = observed.as_deref() else {
+                    return Err(InvalidExtension::new(
+                        "this session has no notarised host (MPC): run it in proxy mode to attest rep.host",
+                    ));
+                };
                 if e.value != observed.as_bytes() {
                     return Err(InvalidExtension::new("rep.host does not match the notarised host"));
                 }
@@ -464,10 +469,13 @@ pub async fn notary<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
             },
         })
         .server_ephemeral_key(binding.server_ephemeral_key.clone())
-        .transcript_commitments(transcript_commitments)
-        // REP: bind the host the notary itself observed under the signed root. If the
-        // prover also requested it, the validator above confirmed the values agree.
-        .extension(Extension { id: b"rep.host".to_vec(), value: attested_host.into_bytes() });
+        .transcript_commitments(transcript_commitments);
+    // REP: bind the host the notary itself observed under the signed root. If the
+    // prover also requested it, the validator above confirmed the values agree.
+    // Omitted when the session has no notarised host (ordinary MPC notarisation).
+    if let Some(host) = attested_host {
+        builder.extension(Extension { id: b"rep.host".to_vec(), value: host.into_bytes() });
+    }
     let attestation = builder
         .build(&provider)
         .map_err(|e| eyre!("Failed to build attestation: {}", e))?;
