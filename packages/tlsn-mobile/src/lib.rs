@@ -40,14 +40,52 @@ pub fn rep_node_commitment(identity: Vec<u8>) -> Vec<u8> {
     rep_identity::node_commitment(&rep_b32(&identity)).to_vec()
 }
 
+/// DEPRECATED, nullifier scheme 1. Scopes uniqueness to the SEGMENT, so one person can hold one
+/// claim per segment and no more. The graph accepts scheme 2 only. Kept exported because the id
+/// stays in the registry forever and old leaves reference it; do not use it for new writes.
 #[uniffi::export]
 pub fn rep_context_nullifier(identity: Vec<u8>, ctype: u16) -> Vec<u8> {
     rep_identity::context_nullifier(&rep_b32(&identity), ctype).to_vec()
 }
 
+/// Nullifier scheme 2: scoped per SOURCE rather than per segment.
 #[uniffi::export]
+pub fn rep_source_nullifier(identity: Vec<u8>, source_id: u16, ctype: u16) -> Vec<u8> {
+    rep_identity::source_nullifier(&rep_b32(&identity), source_id, ctype).to_vec()
+}
+
+/// DEPRECATED. Deterministic per (identity, ctype) with NO per-claim entropy, so a second
+/// same-context commitment leaks the value delta: the hiding term cancels and an observer reads
+/// `C_new - C_old = (v_new - v_old)*G`. Live, not theoretical — the wallet submits on every openai
+/// proof, so re-proving the same source is exactly the repeat case. Use `rep_claim_blinding_seed`.
+#[uniffi::export]
+#[allow(deprecated)]
 pub fn rep_blinding_seed(identity: Vec<u8>, ctype: u16) -> Vec<u8> {
     rep_identity::blinding_seed(&rep_b32(&identity), ctype).to_vec()
+}
+
+/// Per-claim Pedersen blinding: folds the claim's own attestation hash in, so `r` differs per claim
+/// and the delta above never appears.
+///
+/// The seed is never stored. It is re-derivable from the identity plus the attestation hash, which
+/// the device already holds inside the presentation it is re-proving — which is precisely what the
+/// proof vault now guarantees survives.
+#[uniffi::export]
+pub fn rep_claim_blinding_seed(identity: Vec<u8>, ctype: u16, attestation_hash: Vec<u8>) -> Vec<u8> {
+    rep_identity::claim_blinding_seed(&rep_b32(&identity), ctype, &rep_b32(&attestation_hash)).to_vec()
+}
+
+/// BLAKE3-256 of the raw presentation bytes: the value the graph leaf records as
+/// `source_attestation_hash`, and the per-claim input to `rep_claim_blinding_seed`.
+///
+/// Exported rather than reimplemented on the device because it MUST match what the writer computes
+/// (`verify.rs`: `blake3::hash(presentation)`). If the two ever disagree the write still succeeds —
+/// the seed travels with the claim — and the device silently loses the ability to RE-OPEN its own
+/// commitment later, which is the one thing the per-claim seed exists to preserve. CryptoKit has no
+/// BLAKE3, so a Swift-side implementation would be a second copy of a consensus rule.
+#[uniffi::export]
+pub fn rep_attestation_hash(presentation: Vec<u8>) -> Vec<u8> {
+    blake3::hash(&presentation).as_bytes().to_vec()
 }
 
 #[uniffi::export]

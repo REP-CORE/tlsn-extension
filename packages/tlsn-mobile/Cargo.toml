@@ -37,6 +37,10 @@ hex = "0.4"
 # (blake3 + arkworks-bn254 for commit, blake3 for identity); no I/O.
 rep-commit = { path = "../../../rep-graph/rep-commit" }
 rep-identity = { path = "../../../rep-graph/rep-identity" }
+# Already in the graph via rep-identity; declared directly so the bridge can expose the
+# attestation hash the leaf is keyed on. Same major as rep-identity uses, so cargo unifies
+# it rather than linking two copies of the same hash into the binary.
+blake3 = "1"
 
 # UniFFI for Swift/Kotlin bindings
 uniffi = { version = "0.28", features = ["cli"] }
