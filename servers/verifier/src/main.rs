@@ -73,6 +73,10 @@ async fn main() {
             "/verify-presentation",
             post(present_verify::verify_presentation_handler),
         )
+        .route(
+            "/attest-digest",
+            post(present_verify::attest_digest_handler),
+        )
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 

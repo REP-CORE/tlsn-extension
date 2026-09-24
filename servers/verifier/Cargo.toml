@@ -24,6 +24,7 @@ futures-util = "0.3"
 sha1 = "0.10"
 base64 = "0.22"
 k256 = { version = "0.13", features = ["ecdsa"] }  # secp256k1 notary signing key
+blake3 = "1"
 hex = "0.4"
 
 # Serialization

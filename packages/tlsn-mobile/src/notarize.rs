@@ -669,17 +669,84 @@ mod fly_repro_tests {
         };
         let res = notarize_async(request, options).await;
         match &res {
-            Ok(bytes) => {
-                println!("[mobile-fly] ✅ notarize SUCCEEDED: {} presentation bytes", bytes.len());
+            Ok(session) => {
+                // notarize_async returns a NotarizedSession (presentation + attestation +
+                // secrets), not raw bytes — it did once, and this test still assumed so,
+                // which is why the "device-free harness" the docs point at did not compile
+                // (fixed 2026-08-24). Take the presentation; never write `secrets` to disk
+                // here, it carries the FULL transcript including cookies and bearer tokens.
+                println!(
+                    "[mobile-fly] ✅ notarize SUCCEEDED: {} presentation bytes, {} attestation bytes",
+                    session.presentation.len(),
+                    session.attestation.len()
+                );
                 // Save the portable presentation so `rep-verify` can verify it
                 // OFFLINE — the tangible "prove it yourself, no REP, no notary" demo.
                 let out = std::env::var("PRESENTATION_OUT")
                     .unwrap_or_else(|_| "/tmp/rep-demo-presentation.bin".to_string());
-                std::fs::write(&out, bytes).expect("write presentation");
+                std::fs::write(&out, &session.presentation).expect("write presentation");
                 println!("[mobile-fly] saved presentation → {out}");
             }
             Err(e) => println!("[mobile-fly] ❌ notarize FAILED: {}", e),
         }
         assert!(res.is_ok(), "mobile notarize_async failed: {:?}", res.err());
+    }
+
+    /// Device-free GATE for the SENT sizing rule (MPC-HARD-LEARNINGS landmine 1).
+    ///
+    /// Drives `prove_async` — the exact path the iOS app takes for a template that
+    /// declares `.mpcTls` PRIMARY — twice against the real Fly notary, changing ONE
+    /// variable: the declared `max_sent_data`. The request is identical and tiny both
+    /// times, which is the whole point: MPC preprocessing is sized by the DECLARED
+    /// ceiling, before a single request byte is on the wire.
+    ///
+    ///   1 MiB declared  -> expected FAILURE ("context mux error" / preprocess)
+    ///   actual-size cap -> expected SUCCESS
+    ///
+    /// `UniFFIProver.prove()` hardcoded 1 MiB until 2026-08-21 and killed the first
+    /// .mpcTls-primary template (github-user) on device. This test is what should have
+    /// caught it, and what stops it coming back. No phone, no account, no login.
+    ///
+    /// Run:
+    ///   socat TCP-LISTEN:9444,fork,reuseaddr OPENSSL:rep-notary.fly.dev:443,verify=0,snihost=rep-notary.fly.dev &
+    ///   FLY_BRIDGE=ws://127.0.0.1:9444 cargo test --release -p tlsn-mobile mpc_sent_sizing_gate -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn mpc_sent_sizing_gate() {
+        let base = std::env::var("FLY_BRIDGE").unwrap_or_else(|_| "ws://127.0.0.1:9444".to_string());
+        // A tiny public GET, no auth: the shape of github's /user call without needing
+        // a github account. Content is irrelevant — preprocessing fails before it ships.
+        let request = || HttpRequest {
+            url: "https://raw.githubusercontent.com/tlsnotary/tlsn/ceadf458f6f75909eda013aa50108f9f94956188/crates/server-fixture/server/src/data/1kb.json".to_string(),
+            method: "GET".to_string(),
+            headers: vec![HttpHeader { name: "accept".into(), value: "application/json".into() }],
+            body: None,
+        };
+        let opts = |max_sent: u32| ProverOptions {
+            verifier_url: base.clone(),
+            max_sent_data: max_sent,
+            max_recv_data: 8192,
+            handlers: vec![],
+            mode: Some(crate::Mode::Mpc),
+        };
+
+        // 1) the regression: oversized declaration on a 600-byte request.
+        let oversized = crate::prover::prove_async(request(), opts(1_048_576), None).await;
+        match &oversized {
+            Err(e) => println!("[sizing-gate] 1 MiB declared -> failed as expected: {e}"),
+            Ok(_) => println!("[sizing-gate] 1 MiB declared -> SUCCEEDED (notary stream cap was raised?)"),
+        }
+
+        // 2) the fix: same request, ceiling sized to it (what prove() now computes).
+        let sized = crate::prover::prove_async(request(), opts(4096), None).await;
+        match &sized {
+            Ok(_) => println!("[sizing-gate] 4096 declared -> succeeded"),
+            Err(e) => println!("[sizing-gate] 4096 declared -> FAILED: {e}"),
+        }
+
+        // The load-bearing assertion is the FIX, not the repro: if the notary's stream
+        // cap is raised later the oversized case may start passing, and that is fine.
+        // A correctly sized MPC preprocess must always clear.
+        assert!(sized.is_ok(), "correctly sized MPC prove failed: {:?}", sized.err());
     }
 }
