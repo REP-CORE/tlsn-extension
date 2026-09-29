@@ -3,7 +3,9 @@
 # registry.fly.io/rep-notary-tee. A later step mirrors it to a registry Phala can pull.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SERVERS="$HOME/dev/tlsn-extension/servers"
+# Build from a clean checkout by setting SERVERS (e.g. a worktree of choly/tee-notary); the dirty-tree
+# guard below then passes and the image is reconstructable from that commit.
+SERVERS="${SERVERS:-$HOME/dev/tlsn-extension/servers}"
 STAGE="$(mktemp -d)"
 
 echo "staging servers/ + kit in $STAGE"
