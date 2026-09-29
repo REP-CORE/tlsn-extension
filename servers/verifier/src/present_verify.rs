@@ -13,6 +13,8 @@
 //! body: raw presentation bytes (bincode)  ->  JSON VerifyResult
 
 use axum::{body::Bytes, extract::Query, http::StatusCode, Json};
+use k256::ecdsa::{signature::Signer, Signature, SigningKey};
+use k256::elliptic_curve::sec1::ToEncodedPoint;
 use serde::{Deserialize, Serialize};
 use tlsn::{
     attestation::{
@@ -87,6 +89,86 @@ pub async fn verify_presentation_handler(
         sent,
         recv,
         notary_key,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct AttestQuery {
+    /// Optional caller nonce, bound into the signed statement for freshness/anti-replay.
+    pub nonce: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AttestResult {
+    pub ok: bool,
+    pub fact_digest: String, // blake3(presentation) hex = the anchor id the prover uses
+    pub server_name: String,
+    pub time_secs: u64,
+    pub nonce: String,
+    pub statement: String,   // exact utf-8 bytes that were signed
+    pub signature: String,   // ECDSA secp256k1 (SHA-256) over statement, compact r||s hex (64 bytes)
+    pub notary_key: String,  // the in-enclave notary pubkey (compressed hex)
+    pub scheme: String,
+}
+
+/// FAST-PATH attestation. The notary re-signs a compact, domain-separated statement binding
+/// blake3(presentation) so an agent can verify a proof with only secp256k1 + blake3 (no TLSN stack,
+/// no third-party verifier). NOT an oracle: we sign ONLY a presentation that (a) verifies (WebPKI +
+/// notary co-signature) and (b) was co-signed by THIS notary's own key, so a signature can never be
+/// obtained for a fabricated fact. POST /attest-digest?nonce=<hex>  body: raw presentation bytes.
+pub async fn attest_digest_handler(
+    Query(q): Query<AttestQuery>,
+    body: Bytes,
+) -> Result<Json<AttestResult>, (StatusCode, String)> {
+    // Our in-enclave signing key + its compressed pubkey.
+    let key_hex = std::env::var("NOTARY_SIGNING_KEY")
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "NOTARY_SIGNING_KEY not set".to_string()))?;
+    let key_bytes = hex::decode(key_hex.trim())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bad key hex: {e}")))?;
+    let key_arr: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "NOTARY_SIGNING_KEY must be 32 bytes".to_string()))?;
+    let signing_key = SigningKey::from_bytes(&key_arr.into())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bad signing key: {e}")))?;
+    let our_pub = hex::encode(signing_key.verifying_key().to_encoded_point(true).as_bytes());
+
+    // 1. deserialize + require the presentation was co-signed by OUR key (the anti-oracle gate).
+    let presentation: Presentation = bincode::deserialize(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("deserialize presentation: {e}")))?;
+    let pres_key = hex::encode(&presentation.verifying_key().data);
+    if !pres_key.eq_ignore_ascii_case(&our_pub) {
+        return Err((StatusCode::BAD_REQUEST, "presentation was not co-signed by this notary".to_string()));
+    }
+
+    // 2. it must actually verify (WebPKI cert chain + notary signature).
+    let PresentationOutput { server_name, connection_info, .. } = presentation
+        .verify(&CryptoProvider::default())
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("presentation verify failed: {e}")))?;
+    let server_name = match server_name {
+        Some(ServerName::Dns(d)) => d.as_str().to_string(),
+        _ => String::new(),
+    };
+
+    // 3. sign a domain-separated statement binding blake3(presentation) with the in-enclave key.
+    let fact_digest = blake3::hash(&body).to_hex().to_string();
+    let nonce = q.nonce.unwrap_or_default();
+    let statement = format!(
+        "REP-FACT-v1\n{}\n{}\n{}\n{}",
+        fact_digest, server_name, connection_info.time, nonce
+    );
+    let sig: Signature = signing_key.sign(statement.as_bytes());
+
+    Ok(Json(AttestResult {
+        ok: true,
+        fact_digest,
+        server_name,
+        time_secs: connection_info.time,
+        nonce,
+        statement,
+        signature: hex::encode(sig.to_bytes()),
+        notary_key: our_pub,
+        scheme: "ecdsa-secp256k1-sha256; sig=compact-r||s hex (64B); verify over statement utf8-bytes"
+            .to_string(),
     }))
 }
 

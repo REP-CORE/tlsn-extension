@@ -1,0 +1,21 @@
+# Phala dstack app-compose for the notary-in-TEE. The CVM runs this inside a TDX enclave; the
+# measurement dstack reports for this compose is what relying parties pin. entrypoint mints an
+# in-enclave secp256k1 key, binds it into a TDX quote, serves GET /notary/attestation on :7048, and
+# runs the notary (tlsn-verifier-server) on :7047. proxy-mode dials targets from the CVM's egress.
+version: "3"
+services:
+  notary:
+    image: registry.fly.io/rep-notary-tee:deployment-01M37EYKWTEX8SGPAWBBTEX2XP
+    restart: unless-stopped
+    environment:
+      PORT: "7047"
+      ATTEST_PORT: "7048"
+      DATA_DIR: "/data"
+    volumes:
+      - notary-data:/data                       # sealed volume: the in-enclave key persists here
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      - "7047:7047"                             # notary websockets (/notary /proxy /session) + /verify-presentation
+      - "7048:7048"                             # GET /notary/attestation
+volumes:
+  notary-data:
