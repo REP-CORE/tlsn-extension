@@ -4,14 +4,16 @@
 # Built via Fly's remote builder (no local docker) with a REP-CORE git token as a build-secret:
 #   fly deploy --build-only --push -a rep-notary-tee --build-secret ghtoken=<token>
 
-# Base images pinned by digest (not floating tags) so a rebuild is reproducible. Resolved
-# 2026-09-29 from Docker Hub library/rust:bookworm and library/debian:bookworm-slim.
-# REMAINING non-determinism: the two apt-get installs below are NOT version-pinned yet, so apt
-# mirror drift can still change the binary. Pin via snapshot.debian.org (fixed timestamp) or exact
-# package versions, and VALIDATE by building twice and confirming an identical measurement. That is
-# done as part of the step-3 rebuild (see README-REPRO.md), not blind here, because this kit cannot
-# be build-tested locally (Fly remote builder only).
-FROM rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS builder
+# Base images by floating tag (matching the known-good image that boots on dstack).
+# HISTORY 2026-09-29: pinning these by sha256 digest (rust@sha256:93ce27a8…, debian-slim@sha256:3783cc01…)
+# produced an image that FAILED to start a container on dstack (live upgrade AND a staging CVM both went
+# status=error with "No containers found"; the image manifest was a normal single OCI manifest identical
+# in shape to the working image, so it was NOT a pull/format problem — an immediate startup crash, most
+# likely the newer digest-pinned debian-slim changing openssl/keygen behavior at boot). Reverted to
+# floating tags to isolate and get a booting image from committed source. Reproducible base pinning is a
+# follow-up: pin to the SAME digest the known-good image used, or a platform-specific digest, and only
+# after confirming it boots on a staging CVM. See README-REPRO.md / TRUST-MODEL.md.
+FROM rust:bookworm AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev clang cmake protobuf-compiler git && rm -rf /var/lib/apt/lists/*
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -35,7 +37,7 @@ RUN --mount=type=secret,id=ghtoken \
     cargo build --release --bin tlsn-verifier-server && \
     rm -f /root/.git-credentials
 
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+FROM debian:bookworm-slim
 WORKDIR /app
 # GIT_HASH must be the commit SHA of the committed notary snapshot this image is built from, passed
 # by build-notary-tee.sh (--build-arg GIT_HASH=<sha>). The old default "tee" meant the running image
